@@ -55,13 +55,33 @@ def _ensure_edge_color(layer, base_color=(0.5, 0.5, 0.5, 1.0)):
     return edge_color
 
 
+def _get_roi_map_array(layer):
+    if not isinstance(layer, napari.layers.Shapes):
+        return np.empty((0,), dtype=int)
+    meta = layer.metadata if layer.metadata is not None else {}
+    roi_map = np.array(meta.get('roi_map', []), dtype=int)
+    n_shapes = len(layer.data)
+    if roi_map.size < n_shapes:
+        pad = -np.ones(max(0, n_shapes - roi_map.size), dtype=int)
+        roi_map = np.concatenate([roi_map, pad]) if pad.size else roi_map
+        meta['roi_map'] = roi_map
+        layer.metadata = meta
+    elif roi_map.size > n_shapes:
+        roi_map = roi_map[:n_shapes]
+        meta['roi_map'] = roi_map
+        layer.metadata = meta
+    return roi_map
+
+
 def _find_contours_for_orig(layer, target_orig_id):
-    roi_map = np.array(layer.metadata.get('roi_map', []), dtype=int)
+    roi_map = _get_roi_map_array(layer)
     orig_ids = np.array(layer.metadata.get('orig_ids', []), dtype=int)
     indices = []
     if roi_map.size == 0:
         return indices
     for idx, orig_idx in enumerate(roi_map):
+        if orig_idx < 0:
+            continue
         if orig_idx < orig_ids.size:
             actual = int(orig_ids[orig_idx])
         else:
@@ -184,12 +204,30 @@ def store_match_entry(layer, orig_id, other_layer_name, other_orig_id, color, so
 def compute_layer_features(layer):
     metadata = layer.metadata if layer.metadata is not None else {}
     A_full = metadata.get('A_full_orig')
+    use_view = False
+    if A_full is None:
+        A_view = metadata.get('A_view')
+        if A_view is not None:
+            A_full = np.asarray(A_view)
+            use_view = True
     if A_full is None:
         return None
+    A_full = np.asarray(A_full)
+    if A_full.ndim != 2 or A_full.size == 0:
+        return None
     C_full = metadata.get('C_full_orig')
+    if C_full is None:
+        C_view = metadata.get('C_view')
+        if C_view is not None:
+            C_full = np.asarray(C_view)
     kept_mask = metadata.get('kept_mask')
-    if kept_mask is None:
+    if kept_mask is None or use_view:
         kept_mask = np.ones(A_full.shape[1], dtype=bool)
+    else:
+        kept_mask = np.asarray(kept_mask, dtype=bool)
+        if kept_mask.size != A_full.shape[1]:
+            # fall back to all available if mismatch
+            kept_mask = np.ones(A_full.shape[1], dtype=bool)
     kept_indices = np.where(kept_mask)[0]
     if kept_indices.size == 0:
         return None
@@ -201,7 +239,10 @@ def compute_layer_features(layer):
         else:
             return None
     H, W = dims
-    footprints = A_full[:, kept_indices].astype(np.float32)
+    try:
+        footprints = A_full[:, kept_indices].astype(np.float32)
+    except Exception:
+        return None
     footprints = footprints.reshape(H, W, -1, order='F')
     flat = footprints.reshape(-1, footprints.shape[-1])
     flat_mean = flat.mean(axis=0, keepdims=True)
@@ -234,7 +275,11 @@ def compute_layer_features(layer):
     if orig_ids.size == 0:
         actual_ids = kept_indices.astype(int)
     else:
-        actual_ids = orig_ids[kept_indices]
+        max_idx = kept_indices.max() if kept_indices.size else -1
+        if orig_ids.size <= max_idx:
+            actual_ids = kept_indices.astype(int)
+        else:
+            actual_ids = orig_ids[kept_indices]
 
     return {
         'flat_normed': flat_normed,
@@ -697,6 +742,21 @@ class ROIControlPanel(QWidget):
         layer.edge_width = edge_w
         cache_layer_base_edge_color(layer)
 
+    def _report_missing_data(self, layer):
+        meta = layer.metadata if layer.metadata is not None else {}
+        missing = []
+        if meta.get('A_full_orig') is None and meta.get('A_view') is None:
+            missing.append('空间矩阵 A')
+        if meta.get('C_full_orig') is None and meta.get('C_view') is None:
+            missing.append('时间矩阵 C')
+        dims = _parse_dims(meta.get('dims'))
+        if dims is None and meta.get('roi_masks') is None:
+            missing.append('图像尺寸信息')
+        if missing:
+            print(f"⚠️ {layer.name} 缺少配准所需数据：{', '.join(missing)}。请重新导入包含完整估计量的 .h5 或导出 .mat 文件。")
+        else:
+            print(f"⚠️ {layer.name} 的元数据不完整，无法提取特征。请尝试重新导入原始文件。")
+
     def _next_match_color(self):
         color = np.array(self.match_cmap(self.match_color_counter % self.match_cmap.N))
         self.match_color_counter += 1
@@ -886,14 +946,14 @@ class ROIControlPanel(QWidget):
             if len(selected_safe) == 0:
                 continue
 
-            roi_map = np.array(layer.metadata.get('roi_map', []), dtype=int)
+            roi_map = _get_roi_map_array(layer)
             kept_mask = layer.metadata.get('kept_mask', None)
             roi_masks = layer.metadata.get('roi_masks', None)
             C_full_orig = layer.metadata.get('C_full_orig', None)
             A_full_orig = layer.metadata.get('A_full_orig', None)
 
             # which orig ids are removed because of removing these contours
-            removed_orig_ids = np.unique(roi_map[selected_safe]).tolist()
+            removed_orig_ids = [int(x) for x in np.unique(roi_map[selected_safe]).tolist() if int(x) >= 0]
             orig_ids_arr = np.array(layer.metadata.get('orig_ids', []), dtype=int)
             removed_actual_ids = []
             for rid in removed_orig_ids:
@@ -916,7 +976,9 @@ class ROIControlPanel(QWidget):
 
             # update roi_map to reflect only remaining contours
             new_roi_map = roi_map[keep_contours] if len(roi_map) >= len(keep_contours) else roi_map[:len(keep_contours)]
-            layer.metadata['roi_map'] = new_roi_map
+            layer.metadata['roi_map'] = np.array(new_roi_map, dtype=int)
+            cache_layer_base_edge_color(layer)
+            refresh_layer_match_colors(layer)
 
             # create a roi_masks_view (not altering original roi_masks) for convenience: masks for orig ids that are kept
             if roi_masks is not None:
@@ -1040,9 +1102,7 @@ class ROIControlPanel(QWidget):
             try:
                 layer = load_h5_to_viewer(p, self.viewer)
                 self.shapes_layers.append(layer)
-                self.refresh_layer_choices()
-                cache_layer_base_edge_color(layer)
-                self.refresh_all_match_colors()
+                self.register_shapes_layer(layer)
             except Exception as e:
                 print("导入失败:", p, e)
 
@@ -1119,9 +1179,7 @@ class ROIControlPanel(QWidget):
 
                 print(f"Loaded {os.path.basename(p)}: n_rois={n_rois}, contours={len(roi_contours)}, C.shape={C.shape}")
                 self.shapes_layers.append(shapes_layer)
-                self.refresh_layer_choices()
-                cache_layer_base_edge_color(shapes_layer)
-                self.refresh_all_match_colors()
+                self.register_shapes_layer(shapes_layer)
 
             except Exception as e:
                 print("导入 MAT 失败:", p, e)
@@ -1175,7 +1233,7 @@ class ROIControlPanel(QWidget):
         if target is None:
             print("⚠️ 未找到目标 Shapes 层")
             return
-        roi_map = np.array(target.metadata.get('roi_map', []), dtype=int)  # contour -> orig id
+        roi_map = _get_roi_map_array(target)  # contour -> orig id
         if roi_map is None or len(roi_map) == 0:
             print("⚠️ 当前 layer 没有 roi_map，无法按原始 id 修改颜色")
             return
@@ -1344,8 +1402,11 @@ class ROIControlPanel(QWidget):
 
         features_ref = compute_layer_features(ref_layer)
         features_tgt = compute_layer_features(tgt_layer)
+        if features_ref is None:
+            self._report_missing_data(ref_layer)
+        if features_tgt is None:
+            self._report_missing_data(tgt_layer)
         if features_ref is None or features_tgt is None:
-            print("⚠️ 当前 session 缺少配准所需的原始数据 (A/C/dims)")
             return
 
         matches, score_matrix = compute_auto_matches(features_ref, features_tgt, max_dist=max_dist, min_score=min_score, weights=weights)
@@ -1392,7 +1453,7 @@ def on_click(layer, event):
     click_y, click_x = layer.world_to_data(event.position)
     click_xy = (click_x, click_y)
 
-    roi_map = np.array(layer.metadata.get('roi_map', []), dtype=int)  # contour -> original id
+    roi_map = _get_roi_map_array(layer)  # contour -> original id
     C_full_orig = layer.metadata.get('C_full_orig', None)
     kept_mask = layer.metadata.get('kept_mask', None)
     orig_ids = layer.metadata.get('orig_ids', None)
@@ -1412,6 +1473,9 @@ def on_click(layer, event):
 
     # 当前导入文件内的 ROI 索引
     roi_idx_in_file = int(roi_map[found_idx])
+    if roi_idx_in_file < 0:
+        print("⚠️ 该 ROI 未关联原始索引，可能是手绘轮廓。")
+        return
 
     # 获取原始 ID（导入时保存的 kept_orig_ids）
     if orig_ids is not None and roi_idx_in_file < len(orig_ids):
