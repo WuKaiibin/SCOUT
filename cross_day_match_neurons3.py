@@ -9,7 +9,7 @@ from skimage import measure
 from scipy.ndimage import binary_closing, binary_dilation
 import napari
 from qtpy.QtWidgets import (
-    QWidget, QVBoxLayout, QLabel, QSlider, QCheckBox, QComboBox,
+    QWidget, QVBoxLayout, QLabel, QCheckBox, QComboBox,
     QPushButton, QDialog, QTextEdit, QFileDialog, QLineEdit, QHBoxLayout,
     QInputDialog
 )
@@ -480,19 +480,8 @@ class ROIControlPanel(QWidget):
         layout = QVBoxLayout()
 
         # display controls
-        layout.addWidget(QLabel("边框粗细"))
-        self.slider_edge = QSlider()
-        self.slider_edge.setMinimum(1)
-        self.slider_edge.setMaximum(10)
-        self.slider_edge.setValue(2)
-        layout.addWidget(self.slider_edge)
-
-        layout.addWidget(QLabel("填充透明度"))
-        self.slider_alpha = QSlider()
-        self.slider_alpha.setMinimum(0)
-        self.slider_alpha.setMaximum(100)
-        self.slider_alpha.setValue(80)
-        layout.addWidget(self.slider_alpha)
+        self.edge_width = 2
+        self.fill_alpha = 0.8
 
         layout.addWidget(QLabel("ROI 色阶"))
         self.combo_colormap = QComboBox()
@@ -620,8 +609,6 @@ class ROIControlPanel(QWidget):
 
         # connect
         self.combo_display_mode.currentIndexChanged.connect(self.update_all_shapes)
-        self.slider_edge.valueChanged.connect(self.update_all_shapes)
-        self.slider_alpha.valueChanged.connect(self.update_all_shapes)
         self.combo_colormap.currentIndexChanged.connect(self.update_all_shapes)
 
         self.btn_delete.clicked.connect(self.delete_selected_rois)
@@ -692,8 +679,8 @@ class ROIControlPanel(QWidget):
     def _apply_style_to_layer(self, layer):
         if not isinstance(layer, napari.layers.Shapes):
             return
-        alpha = self.slider_alpha.value() / 100
-        edge_w = self.slider_edge.value()
+        alpha = self.fill_alpha
+        edge_w = self.edge_width
         mode = self.combo_display_mode.currentText()
         cmap_local = cm.get_cmap(self.combo_colormap.currentText())
         n_shapes = max(1, len(layer.data))
