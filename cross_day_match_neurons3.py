@@ -42,6 +42,34 @@ def _parse_dims(dims):
     return None
 
 
+def _get_layer_store(layer):
+    """Return the mutable SCOUT-specific store attached to a Shapes layer.
+
+    Napari's ``Shapes.metadata`` property is intended for per-shape tabular
+    data and may clear or coerce arbitrary dictionaries.  To keep the original
+    ROI matrices available after user interactions (saving workspaces, using
+    other plugins, etc.), we cache everything inside a private attribute on the
+    layer.  All helpers fall back to this store and keep it in sync when
+    updating values.
+    """
+
+    if not isinstance(layer, napari.layers.Shapes):
+        return {}
+    store = getattr(layer, "_scout_store", None)
+    if store is None:
+        store = {}
+        setattr(layer, "_scout_store", store)
+    return store
+
+
+def _update_layer_store(layer, updates):
+    if not isinstance(layer, napari.layers.Shapes):
+        return
+    store = _get_layer_store(layer)
+    store.update(updates)
+    setattr(layer, "_scout_store", store)
+
+
 def _ensure_edge_color(layer, base_color=(0.5, 0.5, 0.5, 1.0)):
     n_shapes = len(layer.data)
     if n_shapes == 0:
@@ -58,7 +86,7 @@ def _ensure_edge_color(layer, base_color=(0.5, 0.5, 0.5, 1.0)):
 def _get_roi_map_array(layer):
     if not isinstance(layer, napari.layers.Shapes):
         return np.empty((0,), dtype=int)
-    meta = layer.metadata if layer.metadata is not None else {}
+    meta = _get_layer_store(layer)
     raw_roi_map = meta.get('roi_map', [])
     roi_map = np.array(raw_roi_map, dtype=int).ravel()
     n_shapes = len(layer.data)
@@ -86,13 +114,14 @@ def _get_roi_map_array(layer):
         roi_map = roi_map[:n_shapes]
     if roi_map.size != 0:
         meta['roi_map'] = roi_map.astype(int)
-        layer.metadata = meta
+        _update_layer_store(layer, meta)
     return roi_map
 
 
 def _find_contours_for_orig(layer, target_orig_id):
     roi_map = _get_roi_map_array(layer)
-    orig_ids = np.array(layer.metadata.get('orig_ids', []), dtype=int)
+    meta = _get_layer_store(layer)
+    orig_ids = np.array(meta.get('orig_ids', []), dtype=int)
     indices = []
     if roi_map.size == 0:
         return indices
@@ -115,15 +144,15 @@ def cache_layer_base_edge_color(layer):
         base = np.array(layer.edge_color, dtype=float)
     except Exception:
         base = _ensure_edge_color(layer)
-    meta = layer.metadata if layer.metadata is not None else {}
+    meta = _get_layer_store(layer)
     meta['base_edge_color'] = base
-    layer.metadata = meta
+    _update_layer_store(layer, meta)
 
 
 def refresh_layer_match_colors(layer):
     if not isinstance(layer, napari.layers.Shapes):
         return
-    meta = layer.metadata if layer.metadata is not None else {}
+    meta = _get_layer_store(layer)
     matches = meta.get('matches', {})
     if isinstance(matches, list):
         matches = {int(i): info for i, info in enumerate(matches)}
@@ -131,7 +160,7 @@ def refresh_layer_match_colors(layer):
     if base is None or base.shape[0] != len(layer.data):
         base = _ensure_edge_color(layer)
         meta['base_edge_color'] = base
-        layer.metadata = meta
+        _update_layer_store(layer, meta)
     edge_color = np.array(base, dtype=float)
     if isinstance(matches, dict):
         for key, info in matches.items():
@@ -150,7 +179,7 @@ def refresh_layer_match_colors(layer):
 def remove_matches_between(layer, other_layer_name, source_filter=None):
     if not isinstance(layer, napari.layers.Shapes):
         return []
-    meta = layer.metadata if layer.metadata is not None else {}
+    meta = _get_layer_store(layer)
     raw_matches = meta.get('matches', {})
     if isinstance(raw_matches, dict):
         matches = dict(raw_matches)
@@ -167,7 +196,7 @@ def remove_matches_between(layer, other_layer_name, source_filter=None):
             matches.pop(key, None)
     if removed:
         meta['matches'] = matches
-        layer.metadata = meta
+        _update_layer_store(layer, meta)
     raw_auto = meta.get('auto_matches', {})
     auto_matches = dict(raw_auto) if isinstance(raw_auto, dict) else {}
     changed = False
@@ -178,14 +207,14 @@ def remove_matches_between(layer, other_layer_name, source_filter=None):
             changed = True
     if changed:
         meta['auto_matches'] = auto_matches
-        layer.metadata = meta
+        _update_layer_store(layer, meta)
     return removed
 
 
 def store_match_entry(layer, orig_id, other_layer_name, other_orig_id, color, source, score=None):
     if not isinstance(layer, napari.layers.Shapes):
         return
-    meta = layer.metadata if layer.metadata is not None else {}
+    meta = _get_layer_store(layer)
     raw_matches = meta.get('matches', {})
     if isinstance(raw_matches, dict):
         matches = dict(raw_matches)
@@ -215,11 +244,11 @@ def store_match_entry(layer, orig_id, other_layer_name, other_orig_id, color, so
             auto_entry['score'] = float(score)
         auto_matches[int(orig_id)] = auto_entry
         meta['auto_matches'] = auto_matches
-    layer.metadata = meta
+    _update_layer_store(layer, meta)
 
 
 def compute_layer_features(layer):
-    metadata = layer.metadata if layer.metadata is not None else {}
+    metadata = _get_layer_store(layer)
     layer_name = getattr(layer, 'name', 'unknown')
     A_full = metadata.get('A_full_orig')
     use_view = False
@@ -491,15 +520,22 @@ def load_h5_to_viewer(h5_path, viewer):
 
     # metadata: preserve original full matrices and orig IDs; kept_mask marks which orig IDs are kept
     orig_ids = np.arange(n_rois, dtype=int)
-    shapes_layer.metadata = {
-        'roi_masks': np.array(roi_masks),   # indexed by original id
-        'roi_map': np.array(roi_map, dtype=int),  # contour -> original id
-        'orig_ids': orig_ids,               # original ids (permanent)
-        'C_full_orig': np.array(C),         # DO NOT modify this in place
-        'A_full_orig': np.array(A),         # DO NOT modify
-        'kept_mask': np.ones(n_rois, dtype=bool),  # which original ids still exist
-        'dims': np.array(dims)
-    }
+    _update_layer_store(
+        shapes_layer,
+        {
+            'roi_masks': np.array(roi_masks),   # indexed by original id
+            'roi_map': np.array(roi_map, dtype=int),  # contour -> original id
+            'orig_ids': orig_ids,               # original ids (permanent)
+            'C_full_orig': np.array(C),         # DO NOT modify this in place
+            'A_full_orig': np.array(A),         # DO NOT modify
+            'kept_mask': np.ones(n_rois, dtype=bool),  # which original ids still exist
+            'dims': np.array(dims)
+        },
+    )
+    try:
+        shapes_layer.metadata = {}
+    except Exception:
+        pass
 
     print(f"Loaded {os.path.basename(h5_path)}: n_rois={n_rois}, contours={len(roi_contours)}, C.shape={C.shape}")
     cache_layer_base_edge_color(shapes_layer)
@@ -768,7 +804,7 @@ class ROIControlPanel(QWidget):
         cache_layer_base_edge_color(layer)
 
     def _report_missing_data(self, layer):
-        meta = layer.metadata if layer.metadata is not None else {}
+        meta = _get_layer_store(layer)
         missing = []
         if meta.get('A_full_orig') is None and meta.get('A_view') is None:
             missing.append('空间矩阵 A')
@@ -807,7 +843,7 @@ class ROIControlPanel(QWidget):
     def _get_match_info(self, layer, orig_id):
         if not isinstance(layer, napari.layers.Shapes):
             return None
-        meta = layer.metadata if layer.metadata is not None else {}
+        meta = _get_layer_store(layer)
         raw_matches = meta.get('matches', {})
         if isinstance(raw_matches, dict):
             matches = raw_matches
@@ -825,7 +861,7 @@ class ROIControlPanel(QWidget):
     def _roi_exists(self, layer, orig_id):
         if not isinstance(layer, napari.layers.Shapes):
             return False
-        meta = layer.metadata if layer.metadata is not None else {}
+        meta = _get_layer_store(layer)
         orig_ids = np.array(meta.get('orig_ids', []), dtype=int)
         if orig_ids.size == 0:
             return False
@@ -841,7 +877,7 @@ class ROIControlPanel(QWidget):
     def _remove_match_entry(self, layer, orig_id, update_counterpart=True):
         if not isinstance(layer, napari.layers.Shapes):
             return False
-        meta = layer.metadata if layer.metadata is not None else {}
+        meta = _get_layer_store(layer)
         raw_matches = meta.get('matches', {})
         if isinstance(raw_matches, dict):
             matches = dict(raw_matches)
@@ -852,7 +888,7 @@ class ROIControlPanel(QWidget):
         key = int(orig_id)
         info = matches.pop(key, None)
         if info is None:
-            layer.metadata = meta
+            _update_layer_store(layer, meta)
             return False
         meta['matches'] = matches
         raw_auto = meta.get('auto_matches', {})
@@ -860,12 +896,12 @@ class ROIControlPanel(QWidget):
         if key in auto_matches:
             auto_matches.pop(key, None)
             meta['auto_matches'] = auto_matches
-        layer.metadata = meta
+        _update_layer_store(layer, meta)
         other_layer = None
         if update_counterpart:
             other_layer = self._find_layer_by_name(info.get('target_layer'))
             if other_layer is not None:
-                other_meta = other_layer.metadata if other_layer.metadata is not None else {}
+                other_meta = _get_layer_store(other_layer)
                 raw_other_matches = other_meta.get('matches', {})
                 if isinstance(raw_other_matches, dict):
                     other_matches = dict(raw_other_matches)
@@ -881,7 +917,7 @@ class ROIControlPanel(QWidget):
                 if other_key in other_auto:
                     other_auto.pop(other_key, None)
                     other_meta['auto_matches'] = other_auto
-                other_layer.metadata = other_meta
+                _update_layer_store(other_layer, other_meta)
         refresh_layer_match_colors(layer)
         if other_layer is not None:
             refresh_layer_match_colors(other_layer)
@@ -972,14 +1008,15 @@ class ROIControlPanel(QWidget):
                 continue
 
             roi_map = _get_roi_map_array(layer)
-            kept_mask = layer.metadata.get('kept_mask', None)
-            roi_masks = layer.metadata.get('roi_masks', None)
-            C_full_orig = layer.metadata.get('C_full_orig', None)
-            A_full_orig = layer.metadata.get('A_full_orig', None)
+            meta = _get_layer_store(layer)
+            kept_mask = meta.get('kept_mask', None)
+            roi_masks = meta.get('roi_masks', None)
+            C_full_orig = meta.get('C_full_orig', None)
+            A_full_orig = meta.get('A_full_orig', None)
 
             # which orig ids are removed because of removing these contours
             removed_orig_ids = [int(x) for x in np.unique(roi_map[selected_safe]).tolist() if int(x) >= 0]
-            orig_ids_arr = np.array(layer.metadata.get('orig_ids', []), dtype=int)
+            orig_ids_arr = np.array(meta.get('orig_ids', []), dtype=int)
             removed_actual_ids = []
             for rid in removed_orig_ids:
                 if rid < len(orig_ids_arr):
@@ -992,7 +1029,7 @@ class ROIControlPanel(QWidget):
                 for oid in removed_orig_ids:
                     if 0 <= oid < len(kept_mask):
                         kept_mask[oid] = False
-                layer.metadata['kept_mask'] = kept_mask
+                meta['kept_mask'] = kept_mask
 
             # remove contours from layer.data and update roi_map accordingly
             keep_contours = [i for i in range(n_contours) if i not in selected_safe]
@@ -1001,34 +1038,36 @@ class ROIControlPanel(QWidget):
 
             # update roi_map to reflect only remaining contours
             new_roi_map = roi_map[keep_contours] if len(roi_map) >= len(keep_contours) else roi_map[:len(keep_contours)]
-            layer.metadata['roi_map'] = np.array(new_roi_map, dtype=int)
+            meta['roi_map'] = np.array(new_roi_map, dtype=int)
             cache_layer_base_edge_color(layer)
             refresh_layer_match_colors(layer)
 
             # create a roi_masks_view (not altering original roi_masks) for convenience: masks for orig ids that are kept
             if roi_masks is not None:
                 try:
-                    kept_orig_idxs = np.where(layer.metadata.get('kept_mask', np.ones(1, dtype=bool)))[0]
+                    kept_orig_idxs = np.where(meta.get('kept_mask', np.ones(1, dtype=bool)))[0]
                     new_masks = np.array([roi_masks[int(i)] for i in kept_orig_idxs])
-                    layer.metadata['roi_masks_view'] = new_masks
+                    meta['roi_masks_view'] = new_masks
                 except Exception:
-                    layer.metadata['roi_masks_view'] = None
+                    meta['roi_masks_view'] = None
             else:
-                layer.metadata['roi_masks_view'] = None
+                meta['roi_masks_view'] = None
 
             # create views for C/A if present
             if C_full_orig is not None:
                 try:
-                    kept_orig_idxs = np.where(layer.metadata.get('kept_mask', np.ones(1, dtype=bool)))[0]
-                    layer.metadata['C_view'] = C_full_orig[kept_orig_idxs, :]
+                    kept_orig_idxs = np.where(meta.get('kept_mask', np.ones(1, dtype=bool)))[0]
+                    meta['C_view'] = C_full_orig[kept_orig_idxs, :]
                 except Exception:
-                    layer.metadata['C_view'] = None
+                    meta['C_view'] = None
             if A_full_orig is not None:
                 try:
-                    kept_orig_idxs = np.where(layer.metadata.get('kept_mask', np.ones(1, dtype=bool)))[0]
-                    layer.metadata['A_view'] = A_full_orig[:, kept_orig_idxs]
+                    kept_orig_idxs = np.where(meta.get('kept_mask', np.ones(1, dtype=bool)))[0]
+                    meta['A_view'] = A_full_orig[:, kept_orig_idxs]
                 except Exception:
-                    layer.metadata['A_view'] = None
+                    meta['A_view'] = None
+
+            _update_layer_store(layer, meta)
 
             for actual_id in removed_actual_ids:
                 self._remove_match_entry(layer, actual_id, update_counterpart=True)
@@ -1055,10 +1094,11 @@ class ROIControlPanel(QWidget):
         if active_layer is None or not isinstance(active_layer, napari.layers.Shapes):
             print("⚠️ 请先选中一个 Shapes 层")
             return
-        C_full_orig = active_layer.metadata.get('C_full_orig', None)
-        A_full_orig = active_layer.metadata.get('A_full_orig', None)
-        dims = active_layer.metadata.get('dims', None)
-        kept_mask = active_layer.metadata.get('kept_mask', None)
+        meta = _get_layer_store(active_layer)
+        C_full_orig = meta.get('C_full_orig', None)
+        A_full_orig = meta.get('A_full_orig', None)
+        dims = meta.get('dims', None)
+        kept_mask = meta.get('kept_mask', None)
         if kept_mask is None:
             print("⚠️ 当前 layer 没有 kept_mask，导出全部原始数据")
             kept_idxs = np.arange(C_full_orig.shape[0]) if C_full_orig is not None else np.arange(A_full_orig.shape[1])
@@ -1085,7 +1125,8 @@ class ROIControlPanel(QWidget):
         if not path:
             return
 
-        roi_masks_view = shapes_layer.metadata.get('roi_masks_view', None)
+        meta = _get_layer_store(shapes_layer)
+        roi_masks_view = meta.get('roi_masks_view', None)
         if roi_masks_view is not None and len(roi_masks_view) > 0:
             H, W = roi_masks_view[0].shape
         else:
@@ -1192,15 +1233,22 @@ class ROIControlPanel(QWidget):
 
                 # metadata: preserve original full matrices and orig IDs; kept_mask marks which orig IDs are kept
                 orig_ids = np.array(kept_orig_ids).flatten()
-                shapes_layer.metadata = {
-                    'roi_masks': np.array(roi_masks),   # indexed by original id
-                    'roi_map': np.array(roi_map, dtype=int),  # contour -> original id
-                    'orig_ids': orig_ids,               # original ids (permanent)
-                    'C_full_orig': np.array(C),         # DO NOT modify this in place
-                    'A_full_orig': np.array(A),         # DO NOT modify
-                    'kept_mask': np.ones(n_rois, dtype=bool),  # which original ids still exist
-                    'dims': np.array(dims)
-                }
+                _update_layer_store(
+                    shapes_layer,
+                    {
+                        'roi_masks': np.array(roi_masks),   # indexed by original id
+                        'roi_map': np.array(roi_map, dtype=int),  # contour -> original id
+                        'orig_ids': orig_ids,               # original ids (permanent)
+                        'C_full_orig': np.array(C),         # DO NOT modify this in place
+                        'A_full_orig': np.array(A),         # DO NOT modify
+                        'kept_mask': np.ones(n_rois, dtype=bool),  # which original ids still exist
+                        'dims': np.array(dims)
+                    },
+                )
+                try:
+                    shapes_layer.metadata = {}
+                except Exception:
+                    pass
 
                 print(f"Loaded {os.path.basename(p)}: n_rois={n_rois}, contours={len(roi_contours)}, C.shape={C.shape}")
                 self.shapes_layers.append(shapes_layer)
@@ -1269,7 +1317,8 @@ class ROIControlPanel(QWidget):
                 ec = np.tile(np.array([0.5, 0.5, 0.5, 1.0]), (len(target.data), 1))
         except Exception:
             ec = np.tile(np.array([0.5, 0.5, 0.5, 1.0]), (len(target.data), 1))
-        orig_ids = np.array(target.metadata.get('orig_ids', []), dtype=int)
+        meta = _get_layer_store(target)
+        orig_ids = np.array(meta.get('orig_ids', []), dtype=int)
         for ci, idx_in_file in enumerate(roi_map):
             if idx_in_file < len(orig_ids):
                 orig_id = int(orig_ids[idx_in_file])
@@ -1352,7 +1401,8 @@ class ROIControlPanel(QWidget):
         n_frames, Hf, Wf = frames.shape
         frame_to_overlay = max(0, min(n_frames - 1, frame_to_overlay))
 
-        roi_masks_view = target.metadata.get('roi_masks_view', None)
+        meta = _get_layer_store(target)
+        roi_masks_view = meta.get('roi_masks_view', None)
         if roi_masks_view is not None:
             rm = np.array(roi_masks_view)
             if rm.ndim == 3:
@@ -1479,9 +1529,10 @@ def on_click(layer, event):
     click_xy = (click_x, click_y)
 
     roi_map = _get_roi_map_array(layer)  # contour -> original id
-    C_full_orig = layer.metadata.get('C_full_orig', None)
-    kept_mask = layer.metadata.get('kept_mask', None)
-    orig_ids = layer.metadata.get('orig_ids', None)
+    meta = _get_layer_store(layer)
+    C_full_orig = meta.get('C_full_orig', None)
+    kept_mask = meta.get('kept_mask', None)
+    orig_ids = meta.get('orig_ids', None)
 
     found_idx = None
     for shape_idx, verts in enumerate(layer.data):
@@ -1498,7 +1549,6 @@ def on_click(layer, event):
         )
         roi_map = _get_roi_map_array(layer)
         if found_idx >= len(roi_map):
-            meta = layer.metadata if layer.metadata is not None else {}
             meta_keys = list(meta.keys()) if isinstance(meta, dict) else []
             print(
                 f"❌ 仍然无法找到 roi_map 条目。contours={len(layer.data)}, roi_map_len={len(roi_map)}, metadata_keys={meta_keys}"
@@ -1530,7 +1580,7 @@ def on_click(layer, event):
     try:
         trace = C_full_orig[roi_idx_in_file]
     except Exception:
-        C_view = layer.metadata.get('C_view', None)
+        C_view = meta.get('C_view', None)
         if C_view is not None:
             kept_idxs = np.where(kept_mask)[0] if kept_mask is not None else None
             if kept_idxs is None:
