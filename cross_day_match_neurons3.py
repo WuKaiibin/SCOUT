@@ -59,16 +59,33 @@ def _get_roi_map_array(layer):
     if not isinstance(layer, napari.layers.Shapes):
         return np.empty((0,), dtype=int)
     meta = layer.metadata if layer.metadata is not None else {}
-    roi_map = np.array(meta.get('roi_map', []), dtype=int)
+    raw_roi_map = meta.get('roi_map', [])
+    roi_map = np.array(raw_roi_map, dtype=int).ravel()
     n_shapes = len(layer.data)
+    if roi_map.size == 0 and n_shapes > 0:
+        orig_ids = np.array(meta.get('orig_ids', []), dtype=int)
+        if orig_ids.size >= n_shapes:
+            roi_map = np.arange(n_shapes, dtype=int)
+            print(f"ℹ️ {layer.name}: roi_map 缺失，使用顺序索引重建。")
+        else:
+            roi_map = -np.ones(n_shapes, dtype=int)
+            print(f"ℹ️ {layer.name}: 未找到 roi_map，使用 -1 填充 {n_shapes} 个轮廓。")
     if roi_map.size < n_shapes:
-        pad = -np.ones(max(0, n_shapes - roi_map.size), dtype=int)
-        roi_map = np.concatenate([roi_map, pad]) if pad.size else roi_map
-        meta['roi_map'] = roi_map
-        layer.metadata = meta
+        pad_len = n_shapes - roi_map.size
+        pad = -np.ones(pad_len, dtype=int)
+        roi_map = np.concatenate([roi_map, pad])
+        print(
+            f"ℹ️ {layer.name}: roi_map 长度({roi_map.size - pad_len}) < 轮廓数量({n_shapes})，"
+            f"已为新增的 {pad_len} 个轮廓填充 -1。"
+        )
     elif roi_map.size > n_shapes:
+        print(
+            f"ℹ️ {layer.name}: roi_map 长度({roi_map.size}) 超过轮廓数量({n_shapes})，"
+            "已自动截断以保持一致。"
+        )
         roi_map = roi_map[:n_shapes]
-        meta['roi_map'] = roi_map
+    if roi_map.size != 0:
+        meta['roi_map'] = roi_map.astype(int)
         layer.metadata = meta
     return roi_map
 
@@ -203,6 +220,7 @@ def store_match_entry(layer, orig_id, other_layer_name, other_orig_id, color, so
 
 def compute_layer_features(layer):
     metadata = layer.metadata if layer.metadata is not None else {}
+    layer_name = getattr(layer, 'name', 'unknown')
     A_full = metadata.get('A_full_orig')
     use_view = False
     if A_full is None:
@@ -211,9 +229,11 @@ def compute_layer_features(layer):
             A_full = np.asarray(A_view)
             use_view = True
     if A_full is None:
+        print(f"⚠️ {layer_name}: 元数据缺少空间矩阵 A，无法计算特征。")
         return None
     A_full = np.asarray(A_full)
     if A_full.ndim != 2 or A_full.size == 0:
+        print(f"⚠️ {layer_name}: 空间矩阵 A 形状异常 {A_full.shape}。")
         return None
     C_full = metadata.get('C_full_orig')
     if C_full is None:
@@ -227,9 +247,13 @@ def compute_layer_features(layer):
         kept_mask = np.asarray(kept_mask, dtype=bool)
         if kept_mask.size != A_full.shape[1]:
             # fall back to all available if mismatch
+            print(
+                f"ℹ️ {layer_name}: kept_mask 长度 {kept_mask.size} 与 A_full 列数 {A_full.shape[1]} 不符，使用全部 ROI。"
+            )
             kept_mask = np.ones(A_full.shape[1], dtype=bool)
     kept_indices = np.where(kept_mask)[0]
     if kept_indices.size == 0:
+        print(f"⚠️ {layer_name}: kept_mask 没有有效 ROI。")
         return None
     dims = _parse_dims(metadata.get('dims'))
     if dims is None:
@@ -237,6 +261,7 @@ def compute_layer_features(layer):
         if roi_masks is not None and len(roi_masks) > 0:
             dims = tuple(np.array(roi_masks[0]).shape[:2])
         else:
+            print(f"⚠️ {layer_name}: 缺少图像尺寸信息 dims，且 roi_masks 为空。")
             return None
     H, W = dims
     try:
@@ -1468,8 +1493,17 @@ def on_click(layer, event):
         return
 
     if found_idx >= len(roi_map):
-        print("⚠️ 找不到对应的 roi_map 索引，跳过。")
-        return
+        print(
+            f"⚠️ {layer.name}: 找不到对应的 roi_map 索引 (contour={found_idx}, roi_map_len={len(roi_map)})，尝试自动修复。"
+        )
+        roi_map = _get_roi_map_array(layer)
+        if found_idx >= len(roi_map):
+            meta = layer.metadata if layer.metadata is not None else {}
+            meta_keys = list(meta.keys()) if isinstance(meta, dict) else []
+            print(
+                f"❌ 仍然无法找到 roi_map 条目。contours={len(layer.data)}, roi_map_len={len(roi_map)}, metadata_keys={meta_keys}"
+            )
+            return
 
     # 当前导入文件内的 ROI 索引
     roi_idx_in_file = int(roi_map[found_idx])
