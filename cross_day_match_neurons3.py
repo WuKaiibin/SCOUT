@@ -2,6 +2,7 @@ import os
 import glob
 import h5py
 import numpy as np
+from collections import defaultdict, deque
 from scipy.optimize import linear_sum_assignment
 from scipy.sparse import csr_matrix
 from scipy.spatial.distance import cdist
@@ -21,6 +22,11 @@ from PIL import Image
 import tifffile
 import cv2
 import scipy.io as sio
+
+try:
+    import pandas as pd
+except ImportError:  # pragma: no cover - optional dependency
+    pd = None
 
 # -------------------------
 # helper: get contours from mask robustly
@@ -81,6 +87,89 @@ def _ensure_edge_color(layer, base_color=(0.5, 0.5, 0.5, 1.0)):
     if edge_color.shape[0] != n_shapes:
         edge_color = np.tile(np.array(base_color, dtype=float), (n_shapes, 1))
     return edge_color
+
+
+def _normalize_match_dict(raw_matches):
+    normalized = {}
+    if isinstance(raw_matches, dict):
+        items = raw_matches.items()
+    elif isinstance(raw_matches, list):
+        items = [(idx, value) for idx, value in enumerate(raw_matches)]
+    else:
+        items = []
+    for key, value in items:
+        try:
+            orig_id = int(key)
+        except (TypeError, ValueError):
+            continue
+        entries = []
+        if isinstance(value, dict):
+            if all(isinstance(v, dict) for v in value.values()) and 'target_layer' not in value:
+                for sub in value.values():
+                    entries.append(dict(sub))
+            else:
+                entries.append(dict(value))
+        elif isinstance(value, list):
+            for sub in value:
+                if isinstance(sub, dict):
+                    entries.append(dict(sub))
+        if entries:
+            normalized[orig_id] = entries
+    return normalized
+
+
+def _normalize_auto_matches(raw_auto):
+    normalized = {}
+    if isinstance(raw_auto, dict):
+        items = raw_auto.items()
+    elif isinstance(raw_auto, list):
+        items = [(idx, value) for idx, value in enumerate(raw_auto)]
+    else:
+        items = []
+    for key, value in items:
+        try:
+            orig_id = int(key)
+        except (TypeError, ValueError):
+            continue
+        layer_map = {}
+        if isinstance(value, dict):
+            if 'match_layer' in value:
+                layer = value.get('match_layer')
+                if layer:
+                    layer_map[layer] = dict(value)
+            else:
+                for sub_key, sub_val in value.items():
+                    if isinstance(sub_val, dict):
+                        layer = sub_val.get('match_layer', sub_key)
+                        if layer:
+                            layer_map[layer] = dict(sub_val)
+        elif isinstance(value, list):
+            for sub_val in value:
+                if isinstance(sub_val, dict):
+                    layer = sub_val.get('match_layer')
+                    if layer:
+                        layer_map[layer] = dict(sub_val)
+        if layer_map:
+            normalized[orig_id] = layer_map
+    return normalized
+
+
+def _get_match_color(layer, orig_id):
+    if not isinstance(layer, napari.layers.Shapes):
+        return None
+    meta = _get_layer_store(layer)
+    matches = _normalize_match_dict(meta.get('matches', {}))
+    if orig_id in matches and matches[orig_id]:
+        color = matches[orig_id][0].get('color')
+        if color is not None:
+            try:
+                arr = np.array(color, dtype=float)
+                if arr.size == 3:
+                    arr = np.concatenate([arr, [1.0]])
+                return arr
+            except Exception:
+                return None
+    return None
 
 
 def _get_roi_map_array(layer):
@@ -153,26 +242,29 @@ def refresh_layer_match_colors(layer):
     if not isinstance(layer, napari.layers.Shapes):
         return
     meta = _get_layer_store(layer)
-    matches = meta.get('matches', {})
-    if isinstance(matches, list):
-        matches = {int(i): info for i, info in enumerate(matches)}
+    matches = _normalize_match_dict(meta.get('matches', {}))
+    meta['matches'] = matches
+    _update_layer_store(layer, meta)
     base = np.array(meta.get('base_edge_color'), dtype=float) if 'base_edge_color' in meta else None
     if base is None or base.shape[0] != len(layer.data):
         base = _ensure_edge_color(layer)
         meta['base_edge_color'] = base
         _update_layer_store(layer, meta)
     edge_color = np.array(base, dtype=float)
-    if isinstance(matches, dict):
-        for key, info in matches.items():
-            try:
-                orig_id = int(key)
-            except Exception:
-                continue
-            color = np.array(info.get('color', [0.6, 0.6, 0.6, 1.0]), dtype=float)
-            contours = _find_contours_for_orig(layer, orig_id)
-            for ci in contours:
-                if 0 <= ci < edge_color.shape[0]:
-                    edge_color[ci] = color
+    for key, entries in matches.items():
+        try:
+            orig_id = int(key)
+        except Exception:
+            continue
+        if not entries:
+            continue
+        color = np.array(entries[0].get('color', [0.6, 0.6, 0.6, 1.0]), dtype=float)
+        if color.size == 3:
+            color = np.concatenate([color, [1.0]])
+        contours = _find_contours_for_orig(layer, orig_id)
+        for ci in contours:
+            if 0 <= ci < edge_color.shape[0]:
+                edge_color[ci] = color
     layer.edge_color = edge_color
 
 
@@ -180,32 +272,42 @@ def remove_matches_between(layer, other_layer_name, source_filter=None):
     if not isinstance(layer, napari.layers.Shapes):
         return []
     meta = _get_layer_store(layer)
-    raw_matches = meta.get('matches', {})
-    if isinstance(raw_matches, dict):
-        matches = dict(raw_matches)
-    elif isinstance(raw_matches, list):
-        matches = {int(i): info for i, info in enumerate(raw_matches)}
-    else:
-        matches = {}
+    matches = _normalize_match_dict(meta.get('matches', {}))
     removed = []
-    for key, info in list(matches.items()):
-        target_layer = info.get('target_layer')
-        source = info.get('source')
-        if target_layer == other_layer_name and (source_filter is None or source == source_filter):
+    changed = False
+    for key, entries in list(matches.items()):
+        keep = []
+        removed_here = False
+        for entry in entries:
+            target_layer = entry.get('target_layer')
+            source = entry.get('source')
+            if target_layer == other_layer_name and (source_filter is None or source == source_filter):
+                removed_here = True
+            else:
+                keep.append(entry)
+        if removed_here:
             removed.append(int(key))
-            matches.pop(key, None)
-    if removed:
+            changed = True
+            if keep:
+                matches[key] = keep
+            else:
+                matches.pop(key, None)
+    if changed:
         meta['matches'] = matches
         _update_layer_store(layer, meta)
-    raw_auto = meta.get('auto_matches', {})
-    auto_matches = dict(raw_auto) if isinstance(raw_auto, dict) else {}
-    changed = False
-    for key in list(auto_matches.keys()):
-        info = auto_matches[key]
-        if info.get('match_layer') == other_layer_name and (source_filter is None or info.get('source', 'auto') == source_filter):
+
+    auto_matches = _normalize_auto_matches(meta.get('auto_matches', {}))
+    auto_changed = False
+    for key, target_map in list(auto_matches.items()):
+        for tgt_layer in list(target_map.keys()):
+            info = target_map[tgt_layer]
+            info_source = info.get('source', 'auto') if isinstance(info, dict) else 'auto'
+            if tgt_layer == other_layer_name and (source_filter is None or info_source == source_filter):
+                target_map.pop(tgt_layer, None)
+                auto_changed = True
+        if not target_map:
             auto_matches.pop(key, None)
-            changed = True
-    if changed:
+    if auto_changed:
         meta['auto_matches'] = auto_matches
         _update_layer_store(layer, meta)
     return removed
@@ -215,25 +317,48 @@ def store_match_entry(layer, orig_id, other_layer_name, other_orig_id, color, so
     if not isinstance(layer, napari.layers.Shapes):
         return
     meta = _get_layer_store(layer)
-    raw_matches = meta.get('matches', {})
-    if isinstance(raw_matches, dict):
-        matches = dict(raw_matches)
-    elif isinstance(raw_matches, list):
-        matches = {int(i): info for i, info in enumerate(raw_matches)}
-    else:
-        matches = {}
+    matches = _normalize_match_dict(meta.get('matches', {}))
+    key = int(orig_id)
+    try:
+        color_arr = np.array(color, dtype=float)
+    except Exception:
+        color_arr = None
+    existing_entries = matches.get(key, [])
+    if color_arr is None and existing_entries:
+        color_arr = np.array(existing_entries[0].get('color', [0.6, 0.6, 0.6, 1.0]), dtype=float)
+    if color_arr is None or color_arr.size == 0:
+        color_arr = np.array([0.6, 0.6, 0.6, 1.0], dtype=float)
+    if color_arr.size == 3:
+        color_arr = np.concatenate([color_arr, [1.0]])
+    color_list = [float(c) for c in color_arr]
+
     entry = {
         'target_layer': other_layer_name,
         'target_orig_id': int(other_orig_id),
-        'color': [float(c) for c in color],
+        'color': color_list,
         'source': source,
     }
     if score is not None:
         entry['score'] = float(score)
-    matches[int(orig_id)] = entry
+
+    replaced = False
+    new_entries = []
+    for existing in existing_entries:
+        if existing.get('target_layer') == other_layer_name:
+            updated = dict(existing)
+            updated.update(entry)
+            new_entries.append(updated)
+            replaced = True
+        else:
+            other_copy = dict(existing)
+            other_copy['color'] = color_list
+            new_entries.append(other_copy)
+    if not replaced:
+        new_entries.append(entry)
+    matches[key] = new_entries
     meta['matches'] = matches
-    raw_auto = meta.get('auto_matches', {})
-    auto_matches = dict(raw_auto) if isinstance(raw_auto, dict) else {}
+
+    auto_matches = _normalize_auto_matches(meta.get('auto_matches', {}))
     if source == 'auto':
         auto_entry = {
             'match_layer': other_layer_name,
@@ -242,8 +367,11 @@ def store_match_entry(layer, orig_id, other_layer_name, other_orig_id, color, so
         }
         if score is not None:
             auto_entry['score'] = float(score)
-        auto_matches[int(orig_id)] = auto_entry
+        target_map = auto_matches.get(key, {})
+        target_map[other_layer_name] = auto_entry
+        auto_matches[key] = target_map
         meta['auto_matches'] = auto_matches
+
     _update_layer_store(layer, meta)
 
 
@@ -346,6 +474,41 @@ def compute_layer_features(layer):
     }
 
 
+def _resample_traces(traces, target_len):
+    traces = np.asarray(traces, dtype=np.float32)
+    if traces.ndim != 2 or target_len <= 1:
+        return None
+    current_len = traces.shape[1]
+    if current_len == target_len:
+        return traces.copy()
+    xp = np.linspace(0.0, 1.0, current_len, dtype=np.float32)
+    x_new = np.linspace(0.0, 1.0, target_len, dtype=np.float32)
+    resampled = np.empty((traces.shape[0], target_len), dtype=np.float32)
+    for i in range(traces.shape[0]):
+        resampled[i] = np.interp(x_new, xp, traces[i])
+    resampled -= resampled.mean(axis=1, keepdims=True)
+    norm = np.linalg.norm(resampled, axis=1, keepdims=True)
+    norm[norm == 0] = 1.0
+    return resampled / norm
+
+
+def _align_traces_for_similarity(traces_a, traces_b):
+    if traces_a is None or traces_b is None:
+        return None, None
+    len_a = traces_a.shape[1]
+    len_b = traces_b.shape[1]
+    if len_a == len_b:
+        return np.asarray(traces_a, dtype=np.float32), np.asarray(traces_b, dtype=np.float32)
+    target_len = min(len_a, len_b)
+    if target_len <= 1:
+        return None, None
+    resampled_a = _resample_traces(traces_a, target_len)
+    resampled_b = _resample_traces(traces_b, target_len)
+    if resampled_a is None or resampled_b is None:
+        return None, None
+    return resampled_a, resampled_b
+
+
 def parse_weight_text(text, default=(0.5, 0.3, 0.1, 0.1)):
     if text is None:
         return default
@@ -376,9 +539,15 @@ def compute_auto_matches(features_a, features_b, max_dist=45.0, min_score=0.3, w
     spatial = flat_a.T @ flat_b
     spatial = np.clip(spatial, -1.0, 1.0)
 
-    if features_a['traces_norm'] is not None and features_b['traces_norm'] is not None:
-        temporal = features_a['traces_norm'] @ features_b['traces_norm'].T
-        temporal = np.clip(temporal, -1.0, 1.0)
+    traces_a = features_a['traces_norm']
+    traces_b = features_b['traces_norm']
+    if traces_a is not None and traces_b is not None:
+        aligned_a, aligned_b = _align_traces_for_similarity(traces_a, traces_b)
+        if aligned_a is not None and aligned_b is not None:
+            temporal = aligned_a @ aligned_b.T
+            temporal = np.clip(temporal, -1.0, 1.0)
+        else:
+            temporal = np.zeros_like(spatial)
     else:
         temporal = np.zeros_like(spatial)
 
@@ -442,16 +611,27 @@ def apply_matches(layer_a, layer_b, features_a, features_b, matches, colors=None
     cmap_local = cm.get_cmap('tab20', max(1, len(matches)))
 
     for idx, match in enumerate(matches):
+        color = None
         if colors is not None and idx < len(colors):
-            color = np.array(colors[idx], dtype=float)
-        else:
+            try:
+                color = np.array(colors[idx], dtype=float)
+            except Exception:
+                color = None
+        orig_a = int(features_a['orig_ids'][match['idx_a']])
+        orig_b = int(features_b['orig_ids'][match['idx_b']])
+        if color is None or color.size == 0:
+            existing_a = _get_match_color(layer_a, orig_a)
+            existing_b = _get_match_color(layer_b, orig_b)
+            if existing_a is not None:
+                color = existing_a
+            elif existing_b is not None:
+                color = existing_b
+        if color is None or color.size == 0:
             color = np.array(cmap_local(idx % cmap_local.N))
         if color.size == 3:
             color = np.concatenate([color, [1.0]])
         if color.size == 4:
             color[3] = 1.0
-        orig_a = int(features_a['orig_ids'][match['idx_a']])
-        orig_b = int(features_b['orig_ids'][match['idx_b']])
         store_match_entry(layer_a, orig_a, layer_b.name, orig_b, color, source, score=match.get('score'))
         store_match_entry(layer_b, orig_b, layer_a.name, orig_a, color, source, score=match.get('score'))
 
@@ -621,6 +801,9 @@ class ROIControlPanel(QWidget):
         self.btn_export = QPushButton("导出当前层 C/A (.mat)")
         layout.addWidget(self.btn_export)
 
+        self.btn_export_excel = QPushButton("导出配准结果 Excel")
+        layout.addWidget(self.btn_export_excel)
+
         layout.addSpacing(6)
         # imports
         layout.addWidget(QLabel("数据导入"))
@@ -687,6 +870,9 @@ class ROIControlPanel(QWidget):
         self.btn_auto_match = QPushButton("运行自动配准")
         layout.addWidget(self.btn_auto_match)
 
+        self.btn_auto_match_all = QPushButton("参考 session 匹配全部")
+        layout.addWidget(self.btn_auto_match_all)
+
         layout.addSpacing(8)
         layout.addWidget(QLabel("手动匹配调整"))
         layout.addWidget(QLabel("Session A"))
@@ -721,6 +907,7 @@ class ROIControlPanel(QWidget):
         self.btn_recolor.clicked.connect(self.recolor_rois)
         self.btn_save_img.clicked.connect(self.save_current_image)
         self.btn_export.clicked.connect(self.save_current_layer_data)
+        self.btn_export_excel.clicked.connect(self.export_matches_to_excel)
 
         btn_import_h5.clicked.connect(self.dialog_load_h5)
         btn_import_mat.clicked.connect(self.dialog_load_mat)
@@ -730,6 +917,7 @@ class ROIControlPanel(QWidget):
         btn_update_segments.clicked.connect(self.update_segment_list)
         btn_import_tiff.clicked.connect(self.import_tiff_and_overlay)
         self.btn_auto_match.clicked.connect(self.run_auto_match)
+        self.btn_auto_match_all.clicked.connect(self.run_auto_match_all)
         self.btn_add_manual_match.clicked.connect(self.add_manual_match)
         self.btn_remove_manual_match.clicked.connect(self.remove_manual_match)
 
@@ -840,22 +1028,22 @@ class ROIControlPanel(QWidget):
             return None
         return self._find_layer_by_name(name)
 
-    def _get_match_info(self, layer, orig_id):
+    def _get_match_info(self, layer, orig_id, target_layer=None):
         if not isinstance(layer, napari.layers.Shapes):
             return None
         meta = _get_layer_store(layer)
-        raw_matches = meta.get('matches', {})
-        if isinstance(raw_matches, dict):
-            matches = raw_matches
-        elif isinstance(raw_matches, list):
-            matches = {int(i): info for i, info in enumerate(raw_matches)}
-        else:
-            matches = {}
+        matches = _normalize_match_dict(meta.get('matches', {}))
+        meta['matches'] = matches
+        _update_layer_store(layer, meta)
         key = int(orig_id)
-        if key in matches:
-            return matches[key]
-        if str(key) in matches:
-            return matches[str(key)]
+        entries = matches.get(key)
+        if not entries:
+            return None
+        if target_layer is None:
+            return entries[0]
+        for entry in entries:
+            if entry.get('target_layer') == target_layer:
+                return entry
         return None
 
     def _roi_exists(self, layer, orig_id):
@@ -874,53 +1062,68 @@ class ROIControlPanel(QWidget):
             return bool(kept_mask[idx])
         return True
 
-    def _remove_match_entry(self, layer, orig_id, update_counterpart=True):
+    def _remove_match_entry(self, layer, orig_id, target_layer=None, target_orig_id=None, update_counterpart=True):
         if not isinstance(layer, napari.layers.Shapes):
             return False
         meta = _get_layer_store(layer)
-        raw_matches = meta.get('matches', {})
-        if isinstance(raw_matches, dict):
-            matches = dict(raw_matches)
-        elif isinstance(raw_matches, list):
-            matches = {int(i): info for i, info in enumerate(raw_matches)}
-        else:
-            matches = {}
+        matches = _normalize_match_dict(meta.get('matches', {}))
         key = int(orig_id)
-        info = matches.pop(key, None)
-        if info is None:
+        entries = matches.get(key, [])
+        if not entries:
             _update_layer_store(layer, meta)
             return False
+        keep = []
+        removed_entries = []
+        for entry in entries:
+            layer_match = entry.get('target_layer')
+            orig_match = entry.get('target_orig_id')
+            if target_layer is not None and layer_match != target_layer:
+                keep.append(entry)
+                continue
+            if target_orig_id is not None and int(orig_match) != int(target_orig_id):
+                keep.append(entry)
+                continue
+            removed_entries.append(entry)
+        if not removed_entries:
+            return False
+        if keep:
+            matches[key] = keep
+        else:
+            matches.pop(key, None)
         meta['matches'] = matches
-        raw_auto = meta.get('auto_matches', {})
-        auto_matches = dict(raw_auto) if isinstance(raw_auto, dict) else {}
+
+        auto_matches = _normalize_auto_matches(meta.get('auto_matches', {}))
         if key in auto_matches:
-            auto_matches.pop(key, None)
-            meta['auto_matches'] = auto_matches
+            target_map = auto_matches[key]
+            changed = False
+            for entry in removed_entries:
+                tgt_layer = entry.get('target_layer')
+                if tgt_layer in target_map:
+                    target_map.pop(tgt_layer, None)
+                    changed = True
+            if not target_map:
+                auto_matches.pop(key, None)
+                changed = True
+            if changed:
+                meta['auto_matches'] = auto_matches
+
         _update_layer_store(layer, meta)
-        other_layer = None
+
         if update_counterpart:
-            other_layer = self._find_layer_by_name(info.get('target_layer'))
-            if other_layer is not None:
-                other_meta = _get_layer_store(other_layer)
-                raw_other_matches = other_meta.get('matches', {})
-                if isinstance(raw_other_matches, dict):
-                    other_matches = dict(raw_other_matches)
-                elif isinstance(raw_other_matches, list):
-                    other_matches = {int(i): info for i, info in enumerate(raw_other_matches)}
-                else:
-                    other_matches = {}
-                other_key = int(info.get('target_orig_id'))
-                other_matches.pop(other_key, None)
-                other_meta['matches'] = other_matches
-                raw_other_auto = other_meta.get('auto_matches', {})
-                other_auto = dict(raw_other_auto) if isinstance(raw_other_auto, dict) else {}
-                if other_key in other_auto:
-                    other_auto.pop(other_key, None)
-                    other_meta['auto_matches'] = other_auto
-                _update_layer_store(other_layer, other_meta)
+            for entry in removed_entries:
+                other_layer = self._find_layer_by_name(entry.get('target_layer'))
+                if other_layer is not None:
+                    other_orig = int(entry.get('target_orig_id', -1))
+                    self._remove_match_entry(
+                        other_layer,
+                        other_orig,
+                        target_layer=layer.name,
+                        target_orig_id=int(orig_id),
+                        update_counterpart=False,
+                    )
+                    refresh_layer_match_colors(other_layer)
+
         refresh_layer_match_colors(layer)
-        if other_layer is not None:
-            refresh_layer_match_colors(other_layer)
         return True
 
     def add_manual_match(self):
@@ -949,12 +1152,24 @@ class ROIControlPanel(QWidget):
         if not self._roi_exists(layer_b, orig_b):
             print(f"⚠️ session {layer_b.name} 中找不到 ROI {orig_b}")
             return
-        existing_a = self._get_match_info(layer_a, orig_a)
+        existing_a = self._get_match_info(layer_a, orig_a, target_layer=layer_b.name)
         if existing_a is not None:
-            self._remove_match_entry(layer_a, orig_a, update_counterpart=True)
-        existing_b = self._get_match_info(layer_b, orig_b)
+            self._remove_match_entry(
+                layer_a,
+                orig_a,
+                target_layer=layer_b.name,
+                target_orig_id=orig_b,
+                update_counterpart=True,
+            )
+        existing_b = self._get_match_info(layer_b, orig_b, target_layer=layer_a.name)
         if existing_b is not None:
-            self._remove_match_entry(layer_b, orig_b, update_counterpart=True)
+            self._remove_match_entry(
+                layer_b,
+                orig_b,
+                target_layer=layer_a.name,
+                target_orig_id=orig_a,
+                update_counterpart=True,
+            )
         color = self._next_match_color()
         store_match_entry(layer_a, orig_a, layer_b.name, orig_b, color, source='manual')
         store_match_entry(layer_b, orig_b, layer_a.name, orig_a, color, source='manual')
@@ -979,11 +1194,17 @@ class ROIControlPanel(QWidget):
         except ValueError:
             print("⚠️ ROI ID 需要是整数")
             return
-        info_a = self._get_match_info(layer_a, orig_a)
-        if info_a is None or info_a.get('target_layer') != layer_b.name or int(info_a.get('target_orig_id', -1)) != orig_b:
+        info_a = self._get_match_info(layer_a, orig_a, target_layer=layer_b.name)
+        if info_a is None or int(info_a.get('target_orig_id', -1)) != orig_b:
             print("⚠️ 未找到指定的匹配关系")
             return
-        self._remove_match_entry(layer_a, orig_a, update_counterpart=True)
+        self._remove_match_entry(
+            layer_a,
+            orig_a,
+            target_layer=layer_b.name,
+            target_orig_id=orig_b,
+            update_counterpart=True,
+        )
         print(f"🗑️ 已移除匹配 {layer_a.name}:ROI {orig_a} ↔ {layer_b.name}:ROI {orig_b}")
 
     # update visuals
@@ -1113,6 +1334,188 @@ class ROIControlPanel(QWidget):
             return
         sio.savemat(save_path, {"C": C_export, "A": A_export, "kept_orig_ids": kept_idxs, "dims": dims})
         print(f"💾 已保存当前层 {len(kept_idxs)} 个 ROI 数据到: {save_path}")
+
+    def export_matches_to_excel(self):
+        if pd is None:
+            print("⚠️ 导出 Excel 需要 pandas 库，请先安装 pandas (pip install pandas openpyxl)")
+            return
+        layers = [layer for layer in self.shapes_layers if isinstance(layer, napari.layers.Shapes)]
+        if not layers:
+            print("⚠️ 没有可导出的 session")
+            return
+
+        session_info = {}
+        session_order = {}
+        for idx, layer in enumerate(layers):
+            meta = _get_layer_store(layer)
+            C_full = meta.get('C_full_orig')
+            if C_full is None:
+                C_full = meta.get('C_view')
+            if C_full is None:
+                print(f"⚠️ {layer.name} 缺少时间矩阵 C，跳过该 session 的导出")
+                continue
+            traces = np.asarray(C_full, dtype=np.float32)
+            if traces.ndim == 1:
+                traces = traces[:, None]
+            n_rois, n_frames = traces.shape
+            if n_rois == 0 or n_frames == 0:
+                print(f"⚠️ {layer.name} 没有可用的 ROI 或时间点，跳过导出")
+                continue
+            orig_ids = np.array(meta.get('orig_ids', []), dtype=int)
+            if orig_ids.size != n_rois:
+                orig_ids = np.arange(n_rois, dtype=int)
+            kept_mask = meta.get('kept_mask')
+            if kept_mask is None:
+                kept = np.ones(n_rois, dtype=bool)
+            else:
+                kept = np.asarray(kept_mask, dtype=bool)
+                if kept.size != n_rois:
+                    if kept.size < n_rois:
+                        kept = np.pad(kept, (0, n_rois - kept.size), constant_values=True)
+                    else:
+                        kept = kept[:n_rois]
+            orig_to_idx = {}
+            for i in range(n_rois):
+                if not kept[i]:
+                    continue
+                orig_to_idx[int(orig_ids[i])] = i
+            if not orig_to_idx:
+                print(f"⚠️ {layer.name} 中没有可用的 ROI，跳过导出")
+                continue
+            session_info[layer.name] = {
+                'layer': layer,
+                'traces': traces,
+                'orig_to_idx': orig_to_idx,
+                'frames': n_frames,
+            }
+            session_order[layer.name] = len(session_order)
+
+        if not session_info:
+            print("⚠️ 所有 session 均缺少时间序列数据，无法导出")
+            return
+
+        nodes = set()
+        adjacency = defaultdict(set)
+        for name, info in session_info.items():
+            for orig_id in info['orig_to_idx'].keys():
+                nodes.add((name, int(orig_id)))
+
+        for name, info in session_info.items():
+            meta = _get_layer_store(info['layer'])
+            matches = _normalize_match_dict(meta.get('matches', {}))
+            for orig_id, entries in matches.items():
+                orig_id = int(orig_id)
+                if orig_id not in info['orig_to_idx']:
+                    continue
+                node_a = (name, orig_id)
+                for entry in entries:
+                    target_layer = entry.get('target_layer')
+                    if target_layer not in session_info:
+                        continue
+                    target_orig = int(entry.get('target_orig_id', -1))
+                    target_map = session_info[target_layer]['orig_to_idx']
+                    if target_orig not in target_map:
+                        continue
+                    node_b = (target_layer, target_orig)
+                    adjacency[node_a].add(node_b)
+                    adjacency[node_b].add(node_a)
+
+        if not nodes:
+            print("⚠️ 当前没有可用的 ROI 参与导出")
+            return
+
+        groups = []
+        visited = set()
+        sorted_nodes = sorted(nodes, key=lambda n: (session_order.get(n[0], 0), n[1]))
+        for node in sorted_nodes:
+            if node in visited:
+                continue
+            component = set()
+            queue = deque([node])
+            while queue:
+                cur = queue.popleft()
+                if cur in visited:
+                    continue
+                visited.add(cur)
+                component.add(cur)
+                for nxt in adjacency.get(cur, []):
+                    if nxt not in visited:
+                        queue.append(nxt)
+            groups.append(sorted(component, key=lambda n: (session_order.get(n[0], 0), n[1])))
+
+        if not groups:
+            print("⚠️ 未找到有效的匹配结果可导出")
+            return
+
+        ordered_sessions = sorted(session_info.keys(), key=lambda n: session_order[n])
+        col_labels = [f"Neuron_{i+1:03d}" for i in range(len(groups))]
+
+        summary_rows = []
+        for idx, group in enumerate(groups):
+            row = {'Neuron': col_labels[idx]}
+            for session_name in ordered_sessions:
+                row[session_name] = pd.NA
+            for session_name, orig_id in group:
+                row[session_name] = orig_id
+            summary_rows.append(row)
+
+        session_dfs = []
+        used_names = set()
+
+        def unique_sheet_name(base):
+            name = base[:31] if base else "Sheet"
+            candidate = name or "Sheet"
+            counter = 1
+            while candidate in used_names:
+                suffix = f"_{counter}"
+                candidate = (name[:31 - len(suffix)] + suffix) if len(name) + len(suffix) > 31 else name + suffix
+                if not candidate:
+                    candidate = f"Sheet{counter}"
+                counter += 1
+            used_names.add(candidate)
+            return candidate
+
+        for session_name in ordered_sessions:
+            info = session_info[session_name]
+            traces = info['traces']
+            n_frames = info['frames']
+            data = np.full((n_frames, len(groups)), np.nan, dtype=np.float32)
+            for g_idx, group in enumerate(groups):
+                for node in group:
+                    if node[0] != session_name:
+                        continue
+                    orig_id = node[1]
+                    row_idx = info['orig_to_idx'].get(orig_id)
+                    if row_idx is None:
+                        continue
+                    trace = traces[row_idx]
+                    limit = min(n_frames, trace.shape[0])
+                    data[:limit, g_idx] = trace[:limit]
+                    break
+            df = pd.DataFrame(data, columns=col_labels)
+            df.insert(0, 'frame', np.arange(n_frames))
+            sheet_name = unique_sheet_name(session_name or "Session")
+            session_dfs.append((sheet_name, df))
+
+        summary_df = pd.DataFrame(summary_rows, columns=['Neuron'] + ordered_sessions)
+        summary_sheet = unique_sheet_name('Summary')
+
+        save_path, _ = QFileDialog.getSaveFileName(None, "保存配准结果 Excel", "", "Excel 文件 (*.xlsx)")
+        if not save_path:
+            return
+        if not save_path.lower().endswith('.xlsx'):
+            save_path += '.xlsx'
+
+        try:
+            with pd.ExcelWriter(save_path, engine='xlsxwriter') as writer:
+                for sheet_name, df in session_dfs:
+                    df.to_excel(writer, sheet_name=sheet_name, index=False)
+                summary_df.to_excel(writer, sheet_name=summary_sheet, index=False)
+        except Exception as exc:
+            print(f"❌ 导出 Excel 失败：{exc}")
+            return
+
+        print(f"💾 已导出配准结果到: {save_path}")
 
     # save PNG of current shapes layer (visual)
     def save_current_image(self):
@@ -1445,6 +1848,73 @@ class ROIControlPanel(QWidget):
         tifffile.imwrite(save_path, out_stack, photometric='rgb')
         print(f"✅ 已保存叠加视频到 {save_path}（叠加帧: {frame_to_overlay}）")
 
+    def _auto_match_single_pair(self, ref_layer, tgt_layer, max_dist, min_score, weights, features_ref=None):
+        if not isinstance(ref_layer, napari.layers.Shapes) or not isinstance(tgt_layer, napari.layers.Shapes):
+            return features_ref, False
+
+        if features_ref is None:
+            features_ref = compute_layer_features(ref_layer)
+            if features_ref is None:
+                self._report_missing_data(ref_layer)
+                return None, False
+        features_tgt = compute_layer_features(tgt_layer)
+        if features_tgt is None:
+            self._report_missing_data(tgt_layer)
+            return features_ref, False
+
+        matches, _ = compute_auto_matches(
+            features_ref,
+            features_tgt,
+            max_dist=max_dist,
+            min_score=min_score,
+            weights=weights,
+        )
+        if not matches:
+            print(f"⚠️ {ref_layer.name} ↔ {tgt_layer.name} 未找到满足阈值的候选，请尝试放宽参数")
+            return features_ref, False
+
+        filtered_matches = []
+        skipped_manual = 0
+        for match in matches:
+            orig_a = int(features_ref['orig_ids'][match['idx_a']])
+            orig_b = int(features_tgt['orig_ids'][match['idx_b']])
+            info_a = self._get_match_info(ref_layer, orig_a, target_layer=tgt_layer.name)
+            info_b = self._get_match_info(tgt_layer, orig_b, target_layer=ref_layer.name)
+            if (info_a is not None and info_a.get('source') == 'manual') or (
+                info_b is not None and info_b.get('source') == 'manual'
+            ):
+                skipped_manual += 1
+                continue
+            filtered_matches.append(match)
+        if skipped_manual:
+            print(f"ℹ️ {ref_layer.name} ↔ {tgt_layer.name} 有 {skipped_manual} 对候选匹配被手动配准保留而跳过")
+        if not filtered_matches:
+            print(f"⚠️ {ref_layer.name} ↔ {tgt_layer.name} 的自动配准结果全部被手动匹配覆盖")
+            return features_ref, False
+
+        color_seq = []
+        for match in filtered_matches:
+            orig_a = int(features_ref['orig_ids'][match['idx_a']])
+            orig_b = int(features_tgt['orig_ids'][match['idx_b']])
+            color = _get_match_color(ref_layer, orig_a)
+            if color is None:
+                color = _get_match_color(tgt_layer, orig_b)
+            if color is None:
+                color = self._next_match_color()
+            color_seq.append(color)
+
+        apply_matches(ref_layer, tgt_layer, features_ref, features_tgt, filtered_matches, colors=color_seq, source='auto')
+        self.refresh_all_match_colors()
+        print(f"🤖 自动配准完成：共匹配 {len(filtered_matches)} 对 ROI（{ref_layer.name} ↔ {tgt_layer.name}）")
+        for match in filtered_matches[:10]:
+            orig_a = int(features_ref['orig_ids'][match['idx_a']])
+            orig_b = int(features_tgt['orig_ids'][match['idx_b']])
+            print(
+                f"  · ROI {orig_a} ↔ ROI {orig_b} | score={match['score']:.3f}, "
+                f"spatial={match['spatial']:.3f}, temporal={match['temporal']:.3f}, dist={match['distance']:.2f}"
+            )
+        return features_ref, True
+
     def run_auto_match(self):
         if len(self.shapes_layers) < 2:
             print("⚠️ 至少需要两个 session 才能自动配准")
@@ -1475,44 +1945,56 @@ class ROIControlPanel(QWidget):
             print("⚠️ 选中的 layer 不是 Shapes 类型")
             return
 
-        features_ref = compute_layer_features(ref_layer)
-        features_tgt = compute_layer_features(tgt_layer)
-        if features_ref is None:
-            self._report_missing_data(ref_layer)
-        if features_tgt is None:
-            self._report_missing_data(tgt_layer)
-        if features_ref is None or features_tgt is None:
+        self._auto_match_single_pair(ref_layer, tgt_layer, max_dist, min_score, weights)
+
+    def run_auto_match_all(self):
+        if len(self.shapes_layers) < 2:
+            print("⚠️ 至少需要两个 session 才能自动配准")
+            return
+        ref_idx = self.combo_ref_layer.currentIndex()
+        if ref_idx < 0 or ref_idx >= len(self.shapes_layers):
+            print("⚠️ 请选择参考 session")
+            return
+        try:
+            max_dist = float(self.input_max_dist.text()) if self.input_max_dist.text().strip() else 45.0
+        except ValueError:
+            print("⚠️ 最大距离输入无效，使用默认 45 像素")
+            max_dist = 45.0
+        try:
+            min_score = float(self.input_min_score.text()) if self.input_min_score.text().strip() else 0.3
+        except ValueError:
+            print("⚠️ 最小得分输入无效，使用默认 0.3")
+            min_score = 0.3
+        weights = parse_weight_text(self.input_weights.text())
+
+        ref_layer = self.shapes_layers[ref_idx]
+        if not isinstance(ref_layer, napari.layers.Shapes):
+            print("⚠️ 请选择有效的参考 session")
             return
 
-        matches, score_matrix = compute_auto_matches(features_ref, features_tgt, max_dist=max_dist, min_score=min_score, weights=weights)
-        if not matches:
-            print("⚠️ 未找到满足阈值的匹配对，请尝试放宽参数")
-            return
-        filtered_matches = []
-        skipped_manual = 0
-        for match in matches:
-            orig_a = int(features_ref['orig_ids'][match['idx_a']])
-            orig_b = int(features_tgt['orig_ids'][match['idx_b']])
-            info_a = self._get_match_info(ref_layer, orig_a)
-            info_b = self._get_match_info(tgt_layer, orig_b)
-            if (info_a is not None and info_a.get('source') == 'manual') or (info_b is not None and info_b.get('source') == 'manual'):
-                skipped_manual += 1
+        features_ref = None
+        success = 0
+        total_targets = 0
+        for layer in self.shapes_layers:
+            if layer is ref_layer or not isinstance(layer, napari.layers.Shapes):
                 continue
-            filtered_matches.append(match)
-        if skipped_manual:
-            print(f"ℹ️ 有 {skipped_manual} 对候选匹配被手动配准结果保留而跳过")
-        if not filtered_matches:
-            print("⚠️ 自动配准结果全部被手动指定的匹配覆盖，未进行更新")
-            return
-        matches = filtered_matches
-        color_seq = [self._next_match_color() for _ in range(len(matches))]
-        apply_matches(ref_layer, tgt_layer, features_ref, features_tgt, matches, colors=color_seq, source='auto')
-        self.refresh_all_match_colors()
-        print(f"🤖 自动配准完成：共匹配 {len(matches)} 对 ROI（{ref_layer.name} ↔ {tgt_layer.name}）")
-        for match in matches[:10]:
-            orig_a = int(features_ref['orig_ids'][match['idx_a']])
-            orig_b = int(features_tgt['orig_ids'][match['idx_b']])
-            print(f"  · ROI {orig_a} ↔ ROI {orig_b} | score={match['score']:.3f}, spatial={match['spatial']:.3f}, temporal={match['temporal']:.3f}, dist={match['distance']:.2f}")
+            total_targets += 1
+            features_ref, matched = self._auto_match_single_pair(
+                ref_layer,
+                layer,
+                max_dist,
+                min_score,
+                weights,
+                features_ref=features_ref,
+            )
+            if matched:
+                success += 1
+        if total_targets == 0:
+            print("⚠️ 未找到可配准的其它 session")
+        elif success == 0:
+            print(f"⚠️ {ref_layer.name} 未能与任何其它 session 完成自动配准，请检查数据或参数")
+        else:
+            print(f"✅ 已完成 {success} 个 session 的批量自动配准（参考: {ref_layer.name}）")
 
 
 # -------------------------
