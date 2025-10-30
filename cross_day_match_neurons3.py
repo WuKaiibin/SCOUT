@@ -12,8 +12,9 @@ import napari
 from qtpy.QtWidgets import (
     QWidget, QVBoxLayout, QLabel, QCheckBox, QComboBox,
     QPushButton, QDialog, QTextEdit, QFileDialog, QLineEdit, QHBoxLayout,
-    QInputDialog
+    QInputDialog, QTabWidget, QGroupBox
 )
+from functools import partial
 import matplotlib.cm as cm
 import matplotlib.pyplot as plt
 from matplotlib.path import Path
@@ -763,96 +764,111 @@ class ROIControlPanel(QWidget):
         self.match_cmap = cm.get_cmap('tab20')
         self.match_color_counter = 0
 
-        layout = QVBoxLayout()
+        main_layout = QVBoxLayout()
 
-        # display controls
+        # display defaults
         self.edge_width = 2
         self.fill_alpha = 0.8
 
-        layout.addWidget(QLabel("ROI 色阶"))
+        tabs = QTabWidget()
+        main_layout.addWidget(tabs)
+
+        # ---------------- display tab -----------------
+        display_tab = QWidget()
+        display_layout = QVBoxLayout()
+
+        display_layout.addWidget(QLabel("ROI 色阶"))
         self.combo_colormap = QComboBox()
         self.colormap_list = ['viridis', 'plasma', 'inferno', 'magma', 'cividis', 'cool', 'hot', 'jet']
         self.combo_colormap.addItems(self.colormap_list)
-        layout.addWidget(self.combo_colormap)
+        display_layout.addWidget(self.combo_colormap)
 
-        layout.addWidget(QLabel("显示模式"))
+        display_layout.addWidget(QLabel("显示模式"))
         self.combo_display_mode = QComboBox()
         self.combo_display_mode.addItems(["彩边中空", "黑边填充", "单色中空"])
-        layout.addWidget(self.combo_display_mode)
+        display_layout.addWidget(self.combo_display_mode)
 
+        self.btn_recolor = QPushButton("手动重排 ROI 颜色")
+        display_layout.addWidget(self.btn_recolor)
+
+        display_layout.addSpacing(4)
         self.checkbox_data = QCheckBox("点击 ROI 弹出数据")
         self.checkbox_data.setChecked(True)
-        layout.addWidget(self.checkbox_data)
+        display_layout.addWidget(self.checkbox_data)
 
         self.checkbox_plot = QCheckBox("点击 ROI 弹出曲线图")
         self.checkbox_plot.setChecked(True)
-        layout.addWidget(self.checkbox_plot)
+        display_layout.addWidget(self.checkbox_plot)
 
-        # actions
-        self.btn_save_img = QPushButton("保存当前 ROI 图像")
-        layout.addWidget(self.btn_save_img)
-
-        self.btn_delete = QPushButton("删除选中 ROI")
-        layout.addWidget(self.btn_delete)
-
-        self.btn_recolor = QPushButton("手动重排 ROI 颜色")
-        layout.addWidget(self.btn_recolor)
-
-        self.btn_export = QPushButton("导出当前层 C/A (.mat)")
-        layout.addWidget(self.btn_export)
-
-        self.btn_export_excel = QPushButton("导出配准结果 Excel")
-        layout.addWidget(self.btn_export_excel)
-
-        layout.addSpacing(6)
-        # imports
-        layout.addWidget(QLabel("数据导入"))
-        btn_import_h5 = QPushButton("导入原始数据 (.h5)")
-        btn_import_mat = QPushButton("导入处理数据 (.mat)")
-        btn_import_png = QPushButton("导入背景 (.png 文件夹)")
-        layout.addWidget(btn_import_h5)
-        layout.addWidget(btn_import_mat)
-        layout.addWidget(btn_import_png)
-
-        layout.addSpacing(6)
-        # color by orig ids
-        layout.addWidget(QLabel("按 原始 ROI id 修改颜色（逗号分隔）"))
-        hl = QHBoxLayout()
+        display_layout.addSpacing(4)
+        display_layout.addWidget(QLabel("按 原始 ROI id 修改颜色（逗号分隔）"))
+        color_layout = QHBoxLayout()
         self.input_roi_indices = QLineEdit()
         self.input_roi_indices.setPlaceholderText("例如：0,3,7")
         self.input_rgb = QLineEdit()
         self.input_rgb.setPlaceholderText("例如：255,0,0 或 #FF0000")
         btn_apply_color = QPushButton("修改颜色")
-        hl.addWidget(self.input_roi_indices)
-        hl.addWidget(self.input_rgb)
-        hl.addWidget(btn_apply_color)
-        layout.addLayout(hl)
+        color_layout.addWidget(self.input_roi_indices)
+        color_layout.addWidget(self.input_rgb)
+        color_layout.addWidget(btn_apply_color)
+        display_layout.addLayout(color_layout)
 
-        layout.addSpacing(6)
-        # segments
-        layout.addWidget(QLabel("帧段候选（格式: start-end, start-end）"))
+        display_layout.addStretch(1)
+        display_tab.setLayout(display_layout)
+        tabs.addTab(display_tab, "显示与颜色")
+
+        # ---------------- data tab -----------------
+        data_tab = QWidget()
+        data_layout = QVBoxLayout()
+        data_layout.addWidget(QLabel("数据导入"))
+        btn_import_h5 = QPushButton("导入原始数据 (.h5)")
+        btn_import_mat = QPushButton("导入处理数据 (.mat)")
+        btn_import_png = QPushButton("导入背景 (.png 文件夹)")
+        data_layout.addWidget(btn_import_h5)
+        data_layout.addWidget(btn_import_mat)
+        data_layout.addWidget(btn_import_png)
+
+        data_layout.addSpacing(6)
+        data_layout.addWidget(QLabel("帧段候选（格式: start-end, start-end）"))
         self.input_segments = QLineEdit()
         self.input_segments.setPlaceholderText("例如：0-500,800-1200")
         btn_update_segments = QPushButton("更新帧段按钮")
+        data_layout.addWidget(self.input_segments)
+        data_layout.addWidget(btn_update_segments)
+        data_layout.addWidget(QLabel("选择帧段"))
         self.combo_segments = QComboBox()
-        layout.addWidget(self.input_segments)
-        layout.addWidget(btn_update_segments)
-        layout.addWidget(QLabel("选择帧段"))
-        layout.addWidget(self.combo_segments)
+        data_layout.addWidget(self.combo_segments)
 
-        layout.addSpacing(6)
-        # tiff overlay
+        data_layout.addSpacing(6)
         btn_import_tiff = QPushButton("导入 TIFF 视频并叠加")
-        layout.addWidget(btn_import_tiff)
+        data_layout.addWidget(btn_import_tiff)
 
-        layout.addSpacing(8)
-        layout.addWidget(QLabel("自动配准（SCOUT 特征融合）"))
-        layout.addWidget(QLabel("参考 session"))
+        data_layout.addSpacing(6)
+        self.btn_delete = QPushButton("删除选中 ROI")
+        data_layout.addWidget(self.btn_delete)
+        self.btn_save_img = QPushButton("保存当前 ROI 图像")
+        data_layout.addWidget(self.btn_save_img)
+        self.btn_export = QPushButton("导出当前层 C/A (.mat)")
+        data_layout.addWidget(self.btn_export)
+        self.btn_export_excel = QPushButton("导出配准结果 Excel")
+        data_layout.addWidget(self.btn_export_excel)
+
+        data_layout.addStretch(1)
+        data_tab.setLayout(data_layout)
+        tabs.addTab(data_tab, "数据与导出")
+
+        # ---------------- matching tab -----------------
+        match_tab = QWidget()
+        match_layout = QVBoxLayout()
+
+        auto_group = QGroupBox("自动配准（SCOUT 特征融合）")
+        auto_layout = QVBoxLayout()
+        auto_layout.addWidget(QLabel("参考 session"))
         self.combo_ref_layer = QComboBox()
-        layout.addWidget(self.combo_ref_layer)
-        layout.addWidget(QLabel("待配准 session"))
+        auto_layout.addWidget(self.combo_ref_layer)
+        auto_layout.addWidget(QLabel("待配准 session"))
         self.combo_target_layer = QComboBox()
-        layout.addWidget(self.combo_target_layer)
+        auto_layout.addWidget(self.combo_target_layer)
 
         auto_params_layout = QHBoxLayout()
         self.input_max_dist = QLineEdit()
@@ -861,43 +877,65 @@ class ROIControlPanel(QWidget):
         self.input_min_score.setPlaceholderText("最小得分, 默认0.3")
         auto_params_layout.addWidget(self.input_max_dist)
         auto_params_layout.addWidget(self.input_min_score)
-        layout.addLayout(auto_params_layout)
+        auto_layout.addLayout(auto_params_layout)
 
         self.input_weights = QLineEdit()
         self.input_weights.setPlaceholderText("权重: spatial,temporal,area,distance")
-        layout.addWidget(self.input_weights)
+        auto_layout.addWidget(self.input_weights)
 
         self.btn_auto_match = QPushButton("运行自动配准")
-        layout.addWidget(self.btn_auto_match)
-
+        auto_layout.addWidget(self.btn_auto_match)
         self.btn_auto_match_all = QPushButton("参考 session 匹配全部")
-        layout.addWidget(self.btn_auto_match_all)
+        auto_layout.addWidget(self.btn_auto_match_all)
+        auto_group.setLayout(auto_layout)
+        match_layout.addWidget(auto_group)
 
-        layout.addSpacing(8)
-        layout.addWidget(QLabel("手动匹配调整"))
-        layout.addWidget(QLabel("Session A"))
+        manual_group = QGroupBox("手动匹配调整")
+        manual_layout = QVBoxLayout()
+        manual_layout.addWidget(QLabel("Session A"))
         self.combo_manual_layer_a = QComboBox()
-        layout.addWidget(self.combo_manual_layer_a)
-        layout.addWidget(QLabel("Session B"))
-        self.combo_manual_layer_b = QComboBox()
-        layout.addWidget(self.combo_manual_layer_b)
-        manual_pair_layout = QHBoxLayout()
+        manual_layout.addWidget(self.combo_manual_layer_a)
+        manual_row_a = QHBoxLayout()
         self.input_manual_roi_a = QLineEdit()
         self.input_manual_roi_a.setPlaceholderText("ROI ID A")
+        self.btn_fill_manual_a = QPushButton("读取选中 ROI")
+        manual_row_a.addWidget(self.input_manual_roi_a)
+        manual_row_a.addWidget(self.btn_fill_manual_a)
+        manual_layout.addLayout(manual_row_a)
+
+        manual_layout.addWidget(QLabel("Session B"))
+        self.combo_manual_layer_b = QComboBox()
+        manual_layout.addWidget(self.combo_manual_layer_b)
+        manual_row_b = QHBoxLayout()
         self.input_manual_roi_b = QLineEdit()
         self.input_manual_roi_b.setPlaceholderText("ROI ID B")
-        manual_pair_layout.addWidget(self.input_manual_roi_a)
-        manual_pair_layout.addWidget(self.input_manual_roi_b)
-        layout.addLayout(manual_pair_layout)
+        self.btn_fill_manual_b = QPushButton("读取选中 ROI")
+        manual_row_b.addWidget(self.input_manual_roi_b)
+        manual_row_b.addWidget(self.btn_fill_manual_b)
+        manual_layout.addLayout(manual_row_b)
+
         manual_btn_layout = QHBoxLayout()
         self.btn_add_manual_match = QPushButton("添加手动匹配")
         self.btn_remove_manual_match = QPushButton("取消手动匹配")
         manual_btn_layout.addWidget(self.btn_add_manual_match)
         manual_btn_layout.addWidget(self.btn_remove_manual_match)
-        layout.addLayout(manual_btn_layout)
+        manual_layout.addLayout(manual_btn_layout)
+
+        manual_selected_layout = QHBoxLayout()
+        self.btn_match_selected = QPushButton("使用选中 ROI 配对")
+        self.btn_remove_selected_match = QPushButton("解除选中 ROI 配对")
+        manual_selected_layout.addWidget(self.btn_match_selected)
+        manual_selected_layout.addWidget(self.btn_remove_selected_match)
+        manual_layout.addLayout(manual_selected_layout)
+
+        manual_group.setLayout(manual_layout)
+        match_layout.addWidget(manual_group)
+        match_layout.addStretch(1)
+        match_tab.setLayout(match_layout)
+        tabs.addTab(match_tab, "配准")
 
         # layout finalize
-        self.setLayout(layout)
+        self.setLayout(main_layout)
 
         # connect
         self.combo_display_mode.currentIndexChanged.connect(self.update_all_shapes)
@@ -920,6 +958,10 @@ class ROIControlPanel(QWidget):
         self.btn_auto_match_all.clicked.connect(self.run_auto_match_all)
         self.btn_add_manual_match.clicked.connect(self.add_manual_match)
         self.btn_remove_manual_match.clicked.connect(self.remove_manual_match)
+        self.btn_fill_manual_a.clicked.connect(partial(self.fill_manual_from_selection, 'A'))
+        self.btn_fill_manual_b.clicked.connect(partial(self.fill_manual_from_selection, 'B'))
+        self.btn_match_selected.clicked.connect(self.match_selected_rois)
+        self.btn_remove_selected_match.clicked.connect(self.remove_selected_match)
 
         # default segment list
         self.segment_list = [(0, None)]
@@ -1126,32 +1168,50 @@ class ROIControlPanel(QWidget):
         refresh_layer_match_colors(layer)
         return True
 
-    def add_manual_match(self):
-        layer_a = self._get_layer_by_combo(self.combo_manual_layer_a)
-        layer_b = self._get_layer_by_combo(self.combo_manual_layer_b)
-        if layer_a is None or layer_b is None:
-            print("⚠️ 请选择两个 session")
+    def _selected_orig_id(self, layer):
+        if layer is None or not isinstance(layer, napari.layers.Shapes):
+            return None
+        selected = sorted(list(layer.selected_data))
+        if not selected:
+            return None
+        contour_idx = selected[0]
+        roi_map = _get_roi_map_array(layer)
+        if contour_idx >= len(roi_map):
+            return None
+        orig_idx = int(roi_map[contour_idx])
+        if orig_idx < 0:
+            return None
+        meta = _get_layer_store(layer)
+        orig_ids = np.array(meta.get('orig_ids', []), dtype=int)
+        if orig_idx < orig_ids.size:
+            return int(orig_ids[orig_idx])
+        return int(orig_idx)
+
+    def fill_manual_from_selection(self, side):
+        if side == 'A':
+            combo = self.combo_manual_layer_a
+            line_edit = self.input_manual_roi_a
+        else:
+            combo = self.combo_manual_layer_b
+            line_edit = self.input_manual_roi_b
+        layer = self._get_layer_by_combo(combo)
+        if layer is None:
+            print("⚠️ 请先选择 session")
             return
-        if layer_a == layer_b:
-            print("⚠️ 手动匹配需要选择不同的 session")
+        orig_id = self._selected_orig_id(layer)
+        if orig_id is None:
+            print(f"⚠️ 请在 {layer.name} 中选中一个 ROI")
             return
-        text_a = self.input_manual_roi_a.text().strip()
-        text_b = self.input_manual_roi_b.text().strip()
-        if not text_a or not text_b:
-            print("⚠️ 请填写两侧的 ROI ID")
-            return
-        try:
-            orig_a = int(text_a)
-            orig_b = int(text_b)
-        except ValueError:
-            print("⚠️ ROI ID 需要是整数")
-            return
+        line_edit.setText(str(orig_id))
+        print(f"ℹ️ {layer.name} 选中 ROI 对应原始 ID: {orig_id}")
+
+    def _apply_manual_match_pair(self, layer_a, orig_a, layer_b, orig_b):
         if not self._roi_exists(layer_a, orig_a):
             print(f"⚠️ session {layer_a.name} 中找不到 ROI {orig_a}")
-            return
+            return False
         if not self._roi_exists(layer_b, orig_b):
             print(f"⚠️ session {layer_b.name} 中找不到 ROI {orig_b}")
-            return
+            return False
         existing_a = self._get_match_info(layer_a, orig_a, target_layer=layer_b.name)
         if existing_a is not None:
             self._remove_match_entry(
@@ -1176,6 +1236,62 @@ class ROIControlPanel(QWidget):
         refresh_layer_match_colors(layer_a)
         refresh_layer_match_colors(layer_b)
         print(f"✅ 已手动匹配 {layer_a.name}:ROI {orig_a} ↔ {layer_b.name}:ROI {orig_b}")
+        return True
+
+    def _remove_manual_pair(self, layer_a, orig_a, layer_b, orig_b):
+        info_a = self._get_match_info(layer_a, orig_a, target_layer=layer_b.name)
+        if info_a is None or int(info_a.get('target_orig_id', -1)) != int(orig_b):
+            print("⚠️ 未找到指定的匹配关系")
+            return False
+        self._remove_match_entry(
+            layer_a,
+            orig_a,
+            target_layer=layer_b.name,
+            target_orig_id=orig_b,
+            update_counterpart=True,
+        )
+        print(f"🗑️ 已移除匹配 {layer_a.name}:ROI {orig_a} ↔ {layer_b.name}:ROI {orig_b}")
+        return True
+
+    def _get_orig_from_text(self, line_edit):
+        if line_edit is None:
+            return None
+        text = line_edit.text().strip()
+        if not text:
+            return None
+        try:
+            return int(text)
+        except ValueError:
+            return None
+
+    def _get_orig_from_ui(self, layer, line_edit):
+        selected = self._selected_orig_id(layer)
+        if selected is not None:
+            return selected
+        value = self._get_orig_from_text(line_edit)
+        return value
+
+    def add_manual_match(self):
+        layer_a = self._get_layer_by_combo(self.combo_manual_layer_a)
+        layer_b = self._get_layer_by_combo(self.combo_manual_layer_b)
+        if layer_a is None or layer_b is None:
+            print("⚠️ 请选择两个 session")
+            return
+        if layer_a == layer_b:
+            print("⚠️ 手动匹配需要选择不同的 session")
+            return
+        text_a = self.input_manual_roi_a.text().strip()
+        text_b = self.input_manual_roi_b.text().strip()
+        if not text_a or not text_b:
+            print("⚠️ 请填写两侧的 ROI ID")
+            return
+        try:
+            orig_a = int(text_a)
+            orig_b = int(text_b)
+        except ValueError:
+            print("⚠️ ROI ID 需要是整数")
+            return
+        self._apply_manual_match_pair(layer_a, orig_a, layer_b, orig_b)
 
     def remove_manual_match(self):
         layer_a = self._get_layer_by_combo(self.combo_manual_layer_a)
@@ -1194,18 +1310,49 @@ class ROIControlPanel(QWidget):
         except ValueError:
             print("⚠️ ROI ID 需要是整数")
             return
-        info_a = self._get_match_info(layer_a, orig_a, target_layer=layer_b.name)
-        if info_a is None or int(info_a.get('target_orig_id', -1)) != orig_b:
-            print("⚠️ 未找到指定的匹配关系")
+        self._remove_manual_pair(layer_a, orig_a, layer_b, orig_b)
+
+    def match_selected_rois(self):
+        layer_a = self._get_layer_by_combo(self.combo_manual_layer_a)
+        layer_b = self._get_layer_by_combo(self.combo_manual_layer_b)
+        if layer_a is None or layer_b is None:
+            print("⚠️ 请选择两个 session")
             return
-        self._remove_match_entry(
-            layer_a,
-            orig_a,
-            target_layer=layer_b.name,
-            target_orig_id=orig_b,
-            update_counterpart=True,
-        )
-        print(f"🗑️ 已移除匹配 {layer_a.name}:ROI {orig_a} ↔ {layer_b.name}:ROI {orig_b}")
+        if layer_a == layer_b:
+            print("⚠️ 手动匹配需要选择不同的 session")
+            return
+        orig_a = self._get_orig_from_ui(layer_a, self.input_manual_roi_a)
+        orig_b = self._get_orig_from_ui(layer_b, self.input_manual_roi_b)
+        if orig_a is None:
+            print(f"⚠️ 请在 {layer_a.name} 中选中 ROI 或输入 ID")
+            return
+        if orig_b is None:
+            print(f"⚠️ 请在 {layer_b.name} 中选中 ROI 或输入 ID")
+            return
+        self.input_manual_roi_a.setText(str(orig_a))
+        self.input_manual_roi_b.setText(str(orig_b))
+        self._apply_manual_match_pair(layer_a, orig_a, layer_b, orig_b)
+
+    def remove_selected_match(self):
+        layer_a = self._get_layer_by_combo(self.combo_manual_layer_a)
+        layer_b = self._get_layer_by_combo(self.combo_manual_layer_b)
+        if layer_a is None or layer_b is None:
+            print("⚠️ 请选择两个 session")
+            return
+        if layer_a == layer_b:
+            print("⚠️ 解除匹配需要两个不同的 session")
+            return
+        orig_a = self._get_orig_from_ui(layer_a, self.input_manual_roi_a)
+        orig_b = self._get_orig_from_ui(layer_b, self.input_manual_roi_b)
+        if orig_a is None:
+            print(f"⚠️ 请在 {layer_a.name} 中选中 ROI 或输入 ID")
+            return
+        if orig_b is None:
+            print(f"⚠️ 请在 {layer_b.name} 中选中 ROI 或输入 ID")
+            return
+        self.input_manual_roi_a.setText(str(orig_a))
+        self.input_manual_roi_b.setText(str(orig_b))
+        self._remove_manual_pair(layer_a, orig_a, layer_b, orig_b)
 
     # update visuals
     def update_all_shapes(self):
@@ -1339,6 +1486,16 @@ class ROIControlPanel(QWidget):
         if pd is None:
             print("⚠️ 导出 Excel 需要 pandas 库，请先安装 pandas (pip install pandas openpyxl)")
             return
+        try:
+            import xlsxwriter  # noqa: F401
+            excel_engine = 'xlsxwriter'
+        except ImportError:
+            try:
+                import openpyxl  # noqa: F401
+                excel_engine = 'openpyxl'
+            except ImportError:
+                print("⚠️ 导出 Excel 需要安装 xlsxwriter 或 openpyxl (pip install xlsxwriter 或 pip install openpyxl)")
+                return
         layers = [layer for layer in self.shapes_layers if isinstance(layer, napari.layers.Shapes)]
         if not layers:
             print("⚠️ 没有可导出的 session")
@@ -1507,7 +1664,7 @@ class ROIControlPanel(QWidget):
             save_path += '.xlsx'
 
         try:
-            with pd.ExcelWriter(save_path, engine='xlsxwriter') as writer:
+            with pd.ExcelWriter(save_path, engine=excel_engine) as writer:
                 for sheet_name, df in session_dfs:
                     df.to_excel(writer, sheet_name=sheet_name, index=False)
                 summary_df.to_excel(writer, sheet_name=summary_sheet, index=False)
